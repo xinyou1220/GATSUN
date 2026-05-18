@@ -5,6 +5,15 @@ import torch.nn.functional as F
 from sam3git.sam3.model_builder import _create_vision_backbone
 import sam3.perflib.fused as fused_mod
 
+try:
+    from torch_geometric.nn import GATv2Conv
+    HAS_PYG = True
+except ImportError:
+    HAS_PYG = False
+    print("[WARN] torch_geometric 未安裝，將使用密集 GNN 作為後備。"
+          "  pip install torch_geometric")
+
+
 class DoubleConv(nn.Module):
     def __init__(self, in_ch, out_ch):
         super().__init__()
@@ -39,8 +48,7 @@ class DeformConv2dBlock(nn.Module):
         self.has_deform = False
         try:
             from torchvision.ops import DeformConv2d
-            self.offset_conv = nn.Conv2d(in_ch, 2 * 3 * 3, kernel_size=3,
-                                         padding=1, bias=True)
+            self.offset_conv = nn.Conv2d(in_ch, 2 * 3 * 3, kernel_size=3, padding=1, bias=True)
             nn.init.zeros_(self.offset_conv.weight)
             nn.init.zeros_(self.offset_conv.bias)
             self.deform_conv = DeformConv2d(in_ch, out_ch, kernel_size=3, padding=1)
@@ -78,8 +86,8 @@ class DeformableDecoderBlock(nn.Module):
             x = F.pad(x, [dw // 2, dw - dw // 2, dh // 2, dh - dh // 2])
         return self.conv2(self.conv1(torch.cat([skip, x], dim=1)))
 
-
 class SemanticVesselPrompt(nn.Module):
+
     def __init__(self, n_vessels=3, feat_ch=64, n_prompt_tokens=8, n_heads=4):
         super().__init__()
         self.prompt_tokens = nn.Parameter(
@@ -125,6 +133,7 @@ class VesselTypeConditioning(nn.Module):
         b   = self.shift(emb).unsqueeze(-1).unsqueeze(-1)
         return feat * (1.0 + s) + b
 
+
 class ReIDHead(nn.Module):
     def __init__(self, in_ch=64, embed_dim=128):
         super().__init__()
@@ -146,10 +155,17 @@ class ReIDHead(nn.Module):
             vessel_embed = F.normalize(masked.sum(dim=[2, 3]) / area, p=2, dim=1)
         return pixel_embed, vessel_embed
 
+
 class SparseGATRefinement(nn.Module):
 
-    def __init__(self, feat_ch=64, n_heads=4, gat_layers=2, k_neighbors=16, max_nodes=4096, node_threshold=0.3):
+    def __init__(self, feat_ch=64, n_heads=4, gat_layers=2,
+                 k_neighbors=16, max_nodes=4096, node_threshold=0.3):
         super().__init__()
+        assert HAS_PYG, (
+            "SparseGATRefinement 需要 torch_geometric。\n"
+            "  pip install torch_geometric\n"
+            "  或設定 --use_dense_gnn 退回密集 GNN。")
+
         self.k              = k_neighbors
         self.max_nodes      = max_nodes
         self.node_threshold = node_threshold
@@ -177,6 +193,7 @@ class SparseGATRefinement(nn.Module):
 
     @staticmethod
     def _build_knn_graph(coords, k):
+
         dist = torch.cdist(coords, coords)
         _, indices = dist.topk(k + 1, dim=1, largest=False)
         indices = indices[:, 1:]
@@ -255,6 +272,7 @@ class DenseGNNRefinement(nn.Module):
             x = layer(x, vessel_prob)
         return x
 
+
 def _check_sam3():
     try:
         import sam3
@@ -268,9 +286,10 @@ class SAM3Encoder(nn.Module):
     def __init__(self, checkpoint=None, freeze=True):
         super().__init__()
         _check_sam3()
-        self._patch_fused_kernel()
         self.vision_encoder = _create_vision_backbone(
             compile_mode=None, enable_inst_interactivity=False)
+
+        self._patch_fused_kernel()
         if checkpoint:
             self._load_checkpoint(checkpoint)
         self._frozen = freeze
@@ -281,16 +300,34 @@ class SAM3Encoder(nn.Module):
 
     @staticmethod
     def _patch_fused_kernel():
-        try:
-            def _safe(act_type, linear, x):
-                h = linear(x)
-                if act_type is nn.GELU:   return F.gelu(h)
-                elif act_type is nn.SiLU: return F.silu(h)
-                elif act_type is nn.ReLU: return F.relu(h)
-                return h
-            fused_mod.addmm_act = _safe
-        except (ImportError, AttributeError):
-            pass
+
+        def _safe(act_type, linear, x):
+            h = linear(x)
+            if act_type is nn.GELU:   return F.gelu(h)
+            elif act_type is nn.SiLU: return F.silu(h)
+            elif act_type is nn.ReLU: return F.relu(h)
+            return h
+
+        import sys
+        patched, failed = [], []
+        for mod_name in list(sys.modules.keys()):
+            if not mod_name.startswith("sam3"):
+                continue
+            mod = sys.modules.get(mod_name)
+            if mod is None or not hasattr(mod, "addmm_act"):
+                continue
+            cur = getattr(mod, "addmm_act", None)
+            if cur is _safe:
+                continue
+            try:
+                setattr(mod, "addmm_act", _safe)
+                patched.append(mod_name)
+            except Exception as e:
+                failed.append((mod_name, repr(e)))
+        if patched:
+            print(f"[SAM3] addmm_act patched in {len(patched)} module(s): {patched}")
+        if failed:
+            print(f"[SAM3] addmm_act patch FAILED in: {failed}")
 
     def _load_checkpoint(self, path):
         print(f"[SAM3] Loading checkpoint: {path}")
@@ -354,7 +391,11 @@ class SAM3Encoder(nn.Module):
         if x.shape[1] == 1: x = x.expand(-1, 3, -1, -1)
         x = F.interpolate(x, size=(self.NATIVE_SIZE, self.NATIVE_SIZE),
                           mode="bilinear", align_corners=True)
-        if self._frozen:
+
+        params_frozen = not any(p.requires_grad
+                                for p in self.vision_encoder.parameters())
+        use_no_grad = self._frozen or params_frozen
+        if use_no_grad:
             with torch.no_grad():
                 feats = self._extract_fpn(self.vision_encoder(x))
             feats = [f.detach() for f in feats]
@@ -363,7 +404,9 @@ class SAM3Encoder(nn.Module):
         feats = [f.to(in_dtype) for f in feats]
         if not hasattr(self, "_logged"):
             self._logged = True
-            print(f"[SAM3] FPN: {[f.shape for f in feats]}")
+            print(f"[SAM3] FPN: {[f.shape for f in feats]}  "
+                  f"(_frozen={self._frozen}, params_frozen={params_frozen}, "
+                  f"no_grad={use_no_grad})")
         return feats
 
     def train(self, mode=True):
@@ -371,19 +414,26 @@ class SAM3Encoder(nn.Module):
         if self._frozen: self.vision_encoder.eval()
         return self
 
+
 class UNetV2(nn.Module):
 
     def __init__(
         self,
-        checkpoint=None, freeze=True,
-        n_classes=2, dec_channels=(256, 128, 64),
+        checkpoint=None, 
+        freeze=True,
+        n_classes=2, 
+        dec_channels=(256, 128, 64),
         n_vessels=3,
         use_semantic_prompt=True,
         use_sparse_gat=True,
         use_reid=True,
-        n_prompt_tokens=8, n_prompt_heads=4,
-        gat_layers=2, gat_heads=4,
-        k_neighbors=16, max_nodes=4096, node_threshold=0.3,
+        n_prompt_tokens=8, 
+        n_prompt_heads=4,
+        gat_layers=2, 
+        gat_heads=4,
+        k_neighbors=16, 
+        max_nodes=4096, 
+        node_threshold=0.3,
         gnn_iters=3,
         reid_embed_dim=128,
         **kw,
@@ -472,22 +522,151 @@ class UNetV2(nn.Module):
         if self.use_reid:
             yield from self.reid_head.parameters()
 
-class FocalTverskyLoss(nn.Module):
-    def __init__(self, alpha=0.5, beta=0.5, gamma=4.0/3.0, smooth=1.0):
-        super().__init__()
-        self.alpha, self.beta, self.gamma, self.smooth = alpha, beta, gamma, smooth
 
-    def forward(self, prob, target):
-        B = prob.shape[0]
-        p, t = prob.reshape(B, -1), target.reshape(B, -1).float()
-        tp = (p * t).sum(1)
-        fp = (p * (1 - t)).sum(1)
-        fn = ((1 - p) * t).sum(1)
-        ti = (tp + self.smooth) / (tp + self.alpha * fp + self.beta * fn + self.smooth)
-        return (1.0 - ti).clamp(min=1e-7).pow(self.gamma).mean()
+ALPHA_BOUNDARY     = 4.0
+SIGMA_BOUNDARY     = 3.0
+ALPHA_SKELETON     = 4.0
+SKEL_DILATE_KERNEL = 5
+GT_SKEL_ITERS      = 20
+
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth: float = 1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, target):
+        probs  = torch.sigmoid(logits.float()).contiguous().view(logits.size(0), -1)
+        target = target.float().contiguous().view(target.size(0), -1)
+        inter  = (probs * target).sum(dim=1)
+        dice   = (2.0 * inter + self.smooth) / (probs.sum(dim=1) + target.sum(dim=1) + self.smooth)
+        return 1.0 - dice.mean()
+
+
+class SoftSkeletonize(nn.Module):
+    def __init__(self, iter_num: int = 20):
+        super().__init__()
+        self.iter_num = iter_num
+
+    @staticmethod
+    def soft_erode(img):
+        p1 = -F.max_pool2d(-img, kernel_size=(3, 1), stride=1, padding=(1, 0))
+        p2 = -F.max_pool2d(-img, kernel_size=(1, 3), stride=1, padding=(0, 1))
+        return torch.minimum(p1, p2)
+
+    @staticmethod
+    def soft_dilate(img):
+        return F.max_pool2d(img, kernel_size=3, stride=1, padding=1)
+
+    @classmethod
+    def soft_open(cls, img):
+        return cls.soft_dilate(cls.soft_erode(img))
+
+    def forward(self, img):
+        img  = img.clamp(0.0, 1.0)
+        img1 = self.soft_open(img)
+        skel = F.relu(img - img1)
+        for _ in range(self.iter_num):
+            img   = self.soft_erode(img)
+            img1  = self.soft_open(img)
+            delta = F.relu(img - img1)
+            skel  = skel + F.relu(delta - skel * delta)
+        return skel.clamp(0.0, 1.0)
+
+
+class ClDiceLoss(nn.Module):
+
+    def __init__(self, iter_num: int = 10, smooth: float = 1e-6):
+        super().__init__()
+        self.soft_skel = SoftSkeletonize(iter_num)
+        self.smooth    = smooth
+
+    def forward(self, logits, target):
+        # AMP-safe：上 fp32
+        logits = logits.float()
+        target = target.float().to(device=logits.device)
+        probs  = torch.sigmoid(logits)
+        sp = self.soft_skel(probs)
+        st = self.soft_skel(target)
+        tprec = ((sp * target).sum(dim=(1, 2, 3)) + self.smooth) \
+              / (sp.sum(dim=(1, 2, 3)) + self.smooth)
+        tsens = ((st * probs).sum(dim=(1, 2, 3)) + self.smooth) \
+              / (st.sum(dim=(1, 2, 3)) + self.smooth)
+        cl = (2.0 * tprec * tsens) / (tprec + tsens + self.smooth)
+        return 1.0 - cl.mean()
+
+@torch.no_grad()
+def _boundary_distance(target: torch.Tensor) -> torch.Tensor:
+
+    target_f = target.float()
+    eroded   = -F.max_pool2d(-target_f, kernel_size=3, stride=1, padding=1)
+    boundary = (target_f - eroded).clamp(0.0, 1.0)
+    dilated  = F.max_pool2d(target_f, kernel_size=3, stride=1, padding=1)
+    outer    = (dilated - target_f).clamp(0.0, 1.0)
+    bnd      = ((boundary + outer) > 0).float()
+
+    max_steps = max(1, int(SIGMA_BOUNDARY * 4))
+    dist = torch.full_like(target_f, float(max_steps))
+    cur  = bnd
+    dist = torch.where(cur > 0, torch.zeros_like(dist), dist)
+    for k in range(1, max_steps + 1):
+        cur  = F.max_pool2d(cur, kernel_size=3, stride=1, padding=1)
+        dist = torch.where((cur > 0) & (dist >= max_steps),
+                           torch.full_like(dist, float(k)), dist)
+    return dist
+
+
+@torch.no_grad()
+def _gt_skeleton_band(target: torch.Tensor) -> torch.Tensor:
+
+    target_f = target.float()
+    skel = SoftSkeletonize(iter_num=GT_SKEL_ITERS)(target_f)
+    skel = (skel > 0.5).float()
+    pad  = SKEL_DILATE_KERNEL // 2
+    return F.max_pool2d(skel, kernel_size=SKEL_DILATE_KERNEL,
+                         stride=1, padding=pad)
+
+
+@torch.no_grad()
+def build_weight_map(target: torch.Tensor,
+                     skeleton: torch.Tensor = None) -> torch.Tensor:
+
+    target_f = target.float()
+    d   = _boundary_distance(target_f)
+    w_b = 1.0 + ALPHA_BOUNDARY * torch.exp(-d / SIGMA_BOUNDARY)
+    if skeleton is None:
+        skeleton = _gt_skeleton_band(target_f)
+    w_s = ALPHA_SKELETON * skeleton.float().to(target.device)
+    return w_b + w_s
+
+
+def weighted_bce_with_logits(logits: torch.Tensor, target: torch.Tensor,
+                              weight: torch.Tensor) -> torch.Tensor:
+
+    bce_pp = F.binary_cross_entropy_with_logits(logits, target.float(),
+                                                  reduction="none")
+    w      = weight.float()
+    return (bce_pp * w).sum() / w.sum().clamp_min(1.0)
+
+
+def weighted_dice_loss(logits: torch.Tensor, target: torch.Tensor,
+                       weight: torch.Tensor, smooth: float = 1e-6) -> torch.Tensor:
+
+    probs  = torch.sigmoid(logits.float())
+    target = target.float()
+    weight = weight.float()
+    B = logits.shape[0]
+    p = probs.view(B, -1)
+    t = target.view(B, -1)
+    w = weight.view(B, -1)
+    inter = (w * p * t).sum(dim=1)
+    denom = (w * p).sum(dim=1) + (w * t).sum(dim=1)
+    dice  = (2.0 * inter + smooth) / (denom + smooth)
+    return 1.0 - dice.mean()
 
 
 class InfoNCELoss(nn.Module):
+
     def __init__(self, temperature=0.07):
         super().__init__()
         self.temperature = temperature
@@ -511,21 +690,54 @@ class InfoNCELoss(nn.Module):
 
 
 class SegLossV2(nn.Module):
-    def __init__(self, tversky_alpha=0.5, tversky_beta=0.5,
-                 tversky_gamma=4.0/3.0, lambda_reid=0.1,
-                 reid_temperature=0.07):
+
+    def __init__(self,
+                 lambda_cldice:    float = 0.5,
+                 lambda_reid:      float = 0.1,
+                 cldice_iter:      int   = 10,
+                 reid_temperature: float = 0.07):
         super().__init__()
-        self.tversky     = FocalTverskyLoss(tversky_alpha, tversky_beta, tversky_gamma)
-        self.lambda_reid = lambda_reid
+        self.lambda_cldice = lambda_cldice
+        self.lambda_reid   = lambda_reid
+        self.dice          = DiceLoss()
+        self.cldice        = ClDiceLoss(iter_num=cldice_iter)
         if lambda_reid > 0:
             self.infonce = InfoNCELoss(temperature=reid_temperature)
 
+    @staticmethod
+    def _prep(seg_logits: torch.Tensor,
+              mask_target: torch.Tensor):
+
+        fg_logits = seg_logits[:, 1:2]
+        if mask_target.dim() == 3:
+            target = mask_target.unsqueeze(1)
+        elif mask_target.dim() == 4:
+            target = mask_target
+        else:
+            raise ValueError(f"mask_target dim must be 3 or 4, got {mask_target.dim()}")
+        target = target.to(dtype=fg_logits.dtype)
+        return fg_logits, target
+
     def forward(self, seg_logits, mask_target,
-                reid_dict=None, vessel_ids=None):
-        prob    = torch.sigmoid(seg_logits[:, 1])
-        loss_tv = self.tversky(prob, mask_target)
-        total   = loss_tv
-        result  = {"total": total, "tversky": loss_tv.detach()}
+                reid_dict=None, vessel_ids=None,
+                skeleton=None):
+
+        fg_logits, target = self._prep(seg_logits, mask_target)
+
+        weight = build_weight_map(target, skeleton=skeleton)
+
+        l_bce    = weighted_bce_with_logits(fg_logits, target, weight)
+        l_dice_w = weighted_dice_loss(fg_logits, target, weight)
+        l_cldice = self.cldice(fg_logits, target)
+
+        total = l_bce + l_dice_w + self.lambda_cldice * l_cldice
+
+        result = {
+            "total":       total,
+            "bce_loss":    l_bce.detach(),
+            "dice_loss":   l_dice_w.detach(),
+            "cldice_loss": l_cldice.detach(),
+        }
 
         if (self.lambda_reid > 0 and reid_dict is not None
                 and reid_dict.get("vessel_embed") is not None
@@ -533,8 +745,8 @@ class SegLossV2(nn.Module):
             loss_reid = self.infonce(reid_dict["vessel_embed"], vessel_ids)
             total = total + self.lambda_reid * loss_reid
             result["reid_loss"] = loss_reid.detach()
+            result["total"]     = total
 
-        result["total"] = total
         return result
 
 
@@ -554,3 +766,6 @@ def soft_skeletonize(img, n_iter=15, k=3):
         skel = torch.max(skel, F.relu(cur - soft_open(cur, k)))
         cur  = soft_erode(cur, k)
     return skel
+
+UNet = UNetV2
+SegLoss = SegLossV2

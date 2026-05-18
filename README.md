@@ -1,79 +1,98 @@
 # GATSUN — 冠狀血管語意分割（ARCADE）
 
-本專案在靜態 X 光血管影像上，結合 **SAM3 視覺骨幹**、**UNet 解碼器**、**語意提示（Semantic Prompt）**、**稀疏圖注意力（SparseGAT）** 與 **Re-ID（InfoNCE）**，並支援 **貝茲曲線偽影增強** 與可選的 **Mean Teacher 半監督**（需無標籤資料路徑）。
+在靜態 X 光血管造影上，以 **SAM3 視覺骨幹** 抽取多尺度特徵，接上 **UNet 式解碼器**（最細尺度為 **可變形卷積解碼塊**）、**語意血管提示（Semantic Vessel Prompt）**、**稀疏圖精煉（SparseGAT / 可選密集 GNN）** 與 **Re-ID（InfoNCE）**，針對 **LAD / LCx / RCA** 三類血管做單一聯合模型（JOINT）分割。訓練資料可選 **貝茲曲線偽影增強**（導管／導絲／縫線等，不污染 mask）。
 
 ---
 
-## 專案重點
+## 模型架構（V2）
+
+資料流概覽：
+
+1. **SAM3Encoder**：單通道輸入擴為 3 通道後送入 SAM3 `vision_encoder`，解析 FPN **四層**特徵（預設 `FPN_CH=256`）。
+2. **解碼器**：`DecoderBlock` ×2 自深至淺上採樣並與 skip 拼接；**最淺層**使用 `DeformableDecoderBlock`（`torchvision.ops.DeformConv2d` 不可用時自動退回普通卷積），利於細線狀血管之幾何對齊。
+3. **血管條件化**：預設 `SemanticVesselPrompt`（可學習 prompt token + 交叉注意力 + **FiLM**）；關閉時改為 `VesselTypeConditioning`（Embedding + 仿射調制）。
+4. **粗分割 → 圖精煉**：`pre_seg` 得到初始前景機率，作為 **SparseGAT** 的節點候選門檻（KNN 邊、GATv2）；無 PyG 時改為 **DenseGNNRefinement**（多尺度空洞卷積訊息傳遞）。
+5. **輸出**：`seg_head` 產生 2 類 logits（背景／血管）；可選 `ReIDHead` 對前景區域池化得到 **vessel embedding**，供 **InfoNCE** 與視覺化（t-SNE）。
+
+核心實作：`unet_v2.py`（`UNetV2`、`SegLossV2`）、`train_v2.py`、`evaluate_v2.py`、`data_loader_v2.py`。SAM3 上游在 `sam3git/`。
+
+---
+
+## 損失函數 `SegLossV2`
+
+已改為與血管拓撲、邊界相一致的組合（**不再使用**舊版 Focal–Tversky 作為主分割損失）：
+
+| 元件 | 說明 |
+|------|------|
+| **加權 BCE** | 在 `build_weight_map` 上：邊界距離加權 + 骨架帶加權，強調細長結構與輪廓 |
+| **加權 Dice** | 與同一空間權重結合 |
+| **clDice** | `SoftSkeletonize` 近似骨架，`λ_cldice` 預設 **0.5**（`train_v2.py --lambda_cldice`） |
+| **InfoNCE** | 可選，`λ_reid` 預設 **0.1**（`--lambda_reid`；`--no_reid` 關閉） |
+
+訓練迴圈會記錄 `bce_loss`、`dice_loss`、`cldice_loss`、`dice_coeff`（及 `reid_loss`）至 `train_log.csv`。
+
+---
+
+## 專案重點速覽
 
 | 項目 | 說明 |
 |------|------|
-| 資料 | ARCADE 風格目錄；血管類別 **LAD / LCx / RCA**（對應 `vessel_id` 0/1/2） |
-| 骨幹 | 自 `sam3_weights/sam3.pt` 載入 SAM3，decoder 等為可訓練 |
-| 損失 | **Focal Tversky** + **InfoNCE**（λ_reid 可調） |
-| 圖模組 | 預設 **SparseGAT**（2 層、4 head、k=16）；無 PyG 時可退為密集 GNN |
-| 增強 | 訓練時以機率注入導管／導絲／胸骨縫線等 **偽影**（不污染 mask） |
-
-核心實作：`unet_v2.py`（模型）、`train_v2.py`、`evaluate_v2.py`、`data_loader_v2.py`。上游 SAM3 原始碼在 `sam3git/`。
+| 資料 | ARCADE 風格目錄；`vessel_id`：**0=LAD，1=LCx，2=RCA** |
+| 骨幹 | `sam3_weights/sam3.pt`（路徑由 `--checkpoint` 指定）；可 `--unfreeze` 微調 |
+| 圖模組 | 預設 **SparseGAT**（層數／頭數／k／max_nodes／threshold 可調）；`--use_dense_gnn` 為密集後備 |
+| 增強 | `data_loader_v2.py`：幾何（如 elastic）、mask 感知 **cutout**、貝茲偽影等；`--artifact_prob` 控制偽影機率 |
 
 ---
 
 ## 環境需求
 
-以下為一次實際跑通記錄（見專案根目錄 `log.txt`）：
+- **Python** + **PyTorch**（建議與官方 wheel 對應的 CUDA 版本）  
+- **PyTorch Geometric**（建議安裝以啟用 SparseGAT；否則自動使用密集 GNN）  
+- **SciPy**、**OpenCV**、**scikit-image**、**matplotlib**  
+- 可 `import sam3`（安裝 `sam3git` 或將路徑加入 `PYTHONPATH`）
 
-- **Python**：建議與 PyTorch 官方 wheel 對應的版本  
-- **PyTorch**：`2.9.1+cu128`，**CUDA** 可用（日誌為 NVIDIA GeForce RTX 5090）  
-- **PyTorch Geometric**：`2.7.0`（未安裝時會自動用密集 GNN 後備）  
-- 其他腳本會檢查：**SciPy**、**OpenCV**、**scikit-image**  
-- 需能 `import sam3`（透過安裝 `sam3git` 套件或將路徑加入 `PYTHONPATH`）
-
-請自行準備與 CUDA 版本相符的 PyTorch / PyG 安裝指令；本 repo 未附 `requirements.txt`。
+本 repo 未附固定版號的 `requirements.txt`，請依機器 CUDA 自行對齊 PyTorch / PyG。
 
 ---
 
 ## 資料與目錄約定
 
-- `--data` 指向資料根目錄（範例：`C:/Users/user/Desktop/ARCADE`）。  
-- 載入邏輯見 `data_loader_v2.py`（含快取、合併重切 `merge_split`、偽影增強等）。  
-- **SAM3 預訓練權重**：預設腳本使用 `sam3_weights/sam3.pt`（請自行放置對應檔案）。
+- `--data`：資料根目錄（例如 `C:/.../ARCADE`）。  
+- 載入、快取、`merge_split`、增強等見 `data_loader_v2.py`。  
+- SAM3 權重：訓練時以 `--checkpoint` 指向 `sam3.pt`。
 
 ---
 
 ## 一鍵訓練 + 評估
 
-編輯 `run_all_v2.sh` 頂部變數後，在 **Git Bash**（或相容的 `sh`）執行：
+編輯 `run_all_v2.sh` 頂部變數後執行：
 
 ```bash
 sh run_all_v2.sh
 ```
 
-Windows PowerShell 範例（與 `log.txt` 相同）：
+Windows 可透過 Git 自帶的 `sh`：
 
 ```powershell
 & "C:\Program Files\Git\bin\sh.exe" run_all_v2.sh
 ```
 
-腳本會依設定：
+流程：環境檢查 → `train_v2.py`（權重與 `train_log.csv` 寫入 `checkpoints_v2/`）→ `evaluate_v2.py`（圖表與指標寫入 `results_v2/`）。
 
-1. 檢查 PyTorch / SAM3 / SciPy / OpenCV / skimage  
-2. 呼叫 `train_v2.py` → 權重與日誌寫入 `checkpoints_v2/`  
-3. 呼叫 `evaluate_v2.py` → 圖表與指標寫入 `results_v2/`
-
-可切換 **`PER_VESSEL=true`** 改為三條血管各訓練一個模型（輸出子目錄 `checkpoints_v2/LAD` 等）。
+腳本內 **`PER_VESSEL=true`** 時改為三條血管各訓一個子目錄模型（如 `checkpoints_v2/LAD`）。
 
 ---
 
 ## 手動指令範例
 
-訓練（參數請與 `run_all_v2.sh` 內 `build_train_cmd` 對齊）：
+訓練（其餘旗標請對齊 `train_v2.py --help`）：
 
 ```bash
 python train_v2.py --data <ARCADE_ROOT> --vessels LAD,LCx,RCA \
-  --img_size 512 --epochs 500 --batch 8 --accum_steps 1 --lr 1e-4 \
+  --img_size 512 --epochs 100 --batch 6 --accum_steps 1 --lr 1e-4 \
   --save_dir ./checkpoints_v2 --checkpoint <path/to/sam3.pt> \
-  --merge_split --val_ratio 0.1 --split_seed 42 --amp \
-  # ... 其餘 GAT / ReID / Tversky / artifact 等參數見 train_v2.py --help
+  --merge_split --val_ratio 0.1 --split_seed 67 --amp --unfreeze \
+  --lambda_cldice 0.5 --cldice_iter 10 --lambda_reid 0.1
 ```
 
 評估：
@@ -82,106 +101,90 @@ python train_v2.py --data <ARCADE_ROOT> --vessels LAD,LCx,RCA \
 python evaluate_v2.py --data <ARCADE_ROOT> \
   --ckpt ./checkpoints_v2/best_model.pth \
   --log_csv ./checkpoints_v2/train_log.csv \
-  --vessels LAD,LCx,RCA --img_size 512 --batch 8 \
+  --vessels LAD,LCx,RCA --img_size 512 --batch 6 \
   --out_dir ./results_v2 --n_vis 20 --top_k 4 \
   --cldice_iter 10 --gnn_iters 3 --pp_min_size 50
 ```
 
----
-
-## 實驗設定摘要
-
-| 設定 | 值 |
-|------|-----|
-| 模式 | **JOINT**：單一模型，血管 `LAD,LCx,RCA` |
-| 影像尺寸 | 512 |
-| Epochs / Batch | 500 / 8（accum_steps=1） |
-| 學習率 | 1e-4（backbone 縮放 0.01）；warmup 5 epoch |
-| 資料切分 | `merge_split`，val_ratio=0.1，seed=42 |
-| 樣本數（該次 run） | train+val 預載 1200 張 → train **1081** / val **119** |
-| Semantic Prompt / SparseGAT / ReID | 開 |
-| SparseGAT | 2L, 4H, k=16, max_nodes=4096, node_threshold=0.3 |
-| GNN iters | 3 |
-| Tversky | α=0.5, β=0.5, γ=4/3 |
-| λ_reid | 0.1 |
-| 偽影機率 `artifact_prob` | 0.45 |
-| Mean Teacher | **OFF**（`UNLABELED_DIR` 為空） |
-| AMP | ON |
-
-SAM3 載入：`Loaded 442, missing 0, unexpected 22`。  
-可訓練參數約 **2.97M**（總參數約 457M）。
+評估階段預設：**四向翻轉 TTA**、後處理 **high=0.5**、**low=None**（無雙閾 hysteresis）、`min_size` 小物件過濾；逐張寫入 **Dice / clDice / IoU / HD95**（像素距離）至 `test_metrics.csv`。HD95 與 IoU 實作見 `eval_metrics_extras.py`。
 
 ---
 
-## 訓練結果
+## 訓練設定參考（對齊 `run_all_v2.sh` 預設思路）
 
-- **總訓練時間**：約 **19 小時 9 分**（500 epoch，約 137–223 s/epoch 區間）。  
-- **最佳驗證 Dice**：**0.8280**（`best_model.pth` 存於 `checkpoints_v2/`）。  
-- 最後一個 epoch：`tr` Dice 係數約 **0.8616**，`va` 約 **0.8245**。  
-- 完整逐 epoch 曲線見 `checkpoints_v2/train_log.csv`（欄位含 `tr_total`, `va_dice_coeff`, `lr` 等）。
+以下為腳本中常見預設方向，實際數值請以你本機 `run_all_v2.sh` 與 `train_v2.py` 為準：
 
----
-
-## 測試集與閾值掃描
-
-評估使用 **300** 張測試樣本。後處理預設：`min_size=50`，並以驗證集掃描得到的高閾值做推論（日誌中 **high=0.65, low=None**）。
-
-### 主要測試指標（與驗證選閾一致時）
-
-| 指標 | 數值 |
+| 設定 | 說明 |
 |------|------|
-| Dice（mean ± std） | **0.7832 ± 0.1086** |
-| clDice（mean ± std） | **0.7786 ± 0.1291** |
-| LAD（n=87） | Dice **0.7445**, clDice **0.7470** |
-| LCx（n=113） | Dice **0.7612**, clDice **0.7537** |
-| RCA（n=100） | Dice **0.8416**, clDice **0.8341** |
+| 模式 | **JOINT**：單模型 `LAD,LCx,RCA` |
+| 影像 | 512×512 |
+| 切分 | `--merge_split`、`--val_ratio`、`--split_seed` |
+| 優化 | AdamW、warmup + cosine；backbone 可用較小 `backbone_lr_scale` |
+| SparseGAT | 例如 2 層、4 heads、k=16、max_nodes=4096、node_threshold=0.3 |
+| 偽影 | `artifact_prob` 可設 0（純乾淨影像）至約 0.35（較強增廣） |
 
-### 驗證集閾值掃描（200 張）
-
-- 最佳組合：**high=0.65, low=None**，Dice **0.8661**（Precision/Recall 約 0.8632 / 0.8690）。
-
-### 測試集閾值掃描
-
-- 在測試上最佳：**high=0.30, low=0.12**，Dice **0.7959**。  
-- 日誌提示：驗證與測試的最佳 **high** 相差 **0.35**，代表 **val/test 分佈有差異**；若要在測試上極大化 Dice，宜在測試或獨立校準集上選閾值，而非直接沿用驗證集 high=0.65。
+`train_v2.py` 會將結構相關設定存入 `checkpoints_v2/model_config.pth`，供 `evaluate_v2.py` 還原與訓練時相同的 GAT／提示／ReID 開關。
 
 ---
 
-## 視覺化與結果檔案
+## 測試集最佳結果（300 張）
 
-執行 `evaluate_v2.py` 後，預期在 `results_v2/` 產生（路徑與 `log.txt` 一致）：
+下列為目前管線在測試集上回報之 **整體 mean ± std**（每張圖先算再平均）與 **分血管平均**；推理與 `evaluate_v2.py` 一致（含 TTA 與固定閾值後處理）。**RCA** 在各指標上優於 LAD 與 LCx，與解剖上右冠較常呈單幹、對比相對集中等現象一致，但仍需依臨床資料分布解讀。
+
+### 整體
+
+| 指標 | mean ± std |
+|------|------------|
+| **Dice** | **0.8154 ± 0.0951** |
+| **clDice** | **0.8196 ± 0.1168** |
+| **IoU** | **0.6980 ± 0.1217** |
+| **HD95**（px） | **58.2507 ± 48.7426** |
+
+### 各血管（樣本數 N 與平均）
+
+| 血管 | N | Dice | clDice | IoU | HD95（px） |
+|------|---:|------|--------|-----|------------|
+| **LAD** | 87 | 0.7894 | 0.7976 | 0.6677 | 64.91 |
+| **LCx** | 113 | 0.7932 | 0.7969 | 0.6642 | 63.58 |
+| **RCA** | 100 | 0.8631 | 0.8643 | 0.7626 | 46.43 |
+
+---
+
+## 視覺化與輸出檔案
+
+執行 `evaluate_v2.py` 後，`results_v2/` 典型內容：
 
 | 檔案 | 說明 |
 |------|------|
-| `training_curves.png` | 由 `train_log.csv` 繪製訓練曲線 |
-| `reid_tsne.png` | 300 筆測試嵌入的 **t-SNE** |
-| `summary_grid.png` | 視覺化摘要網格（原圖／預測／疊加 等） |
-| `test_metrics.csv` | 每張測試圖的 **Dice / clDice / vessel_id** |
+| `training_curves.png` | 由 `train_log.csv` 繪製 |
+| `summary_grid.png` | 依 Dice 挑選 worst / median / best 等網格 |
+| `fixed_samples.png` | 預設難／易案例對照（見 `FIXED_VIS_SAMPLES`） |
+| `reid_tsne.png` | 測試集 vessel embedding 之 t-SNE（若訓練啟用 ReID） |
+| `test_metrics.csv` | 每張：**dice, cldice, iou, hd95, vessel_id** |
+| `inference_profile.txt` | `eval_metrics_extras` 估算之 GFLOPs 與延遲 |
 
-> **備註**：若你 clone 的目錄裡目前只有 `test_metrics.csv`，代表圖檔可能未一併提交；在本機重新跑一次 `evaluate_v2.py` 即可還原上述 PNG。
+比對圖目錄：`results_v2/compare_vis/`（若啟用視覺化匯出）。
 
 ---
 
 ## `test_metrics.csv` 範例列
 
-`vessel_id`：**0=LAD，1=LCx，2=RCA**。
-
 **較佳範例（Dice 高）**
 
+| filename | dice | cldice | iou | vessel_id |
+|----------|------|--------|-----|-----------|
+| 101 | 0.9525 | 0.9738 | 0.9094 | 2 (RCA) |
+| 53 | 0.9402 | 0.9618 | 0.8871 | 2 (RCA) |
+| 139 | 0.9399 | 0.9908 | 0.8867 | 2 (RCA) |
+| 64 | 0.9376 | 0.9850 | 0.8826 | 0 (LAD) |
+
+**較難範例（Dice 低，供錯誤分析）**
+
 | filename | dice | cldice | vessel_id |
 |----------|------|--------|-----------|
-| 101 | 0.9493 | 0.9605 | 2 (RCA) |
-| 195 | 0.9538 | 0.9873 | 2 (RCA) |
-| 139 | 0.9370 | 0.9903 | 2 (RCA) |
-| 291 | 0.9055 | 0.9734 | 0 (LAD) |
-
-**較難範例（Dice 低，可供錯誤分析）**
-
-| filename | dice | cldice | vessel_id |
-|----------|------|--------|-----------|
-| 88 | 0.2104 | 0.1648 | 0 (LAD) |
-| 72 | 0.3240 | 0.1788 | 0 (LAD) |
-| 142 | 0.3034 | 0.2507 | 0 (LAD) |
+| 146 | 0.2806 | 0.1816 | 0 (LAD) |
+| 152 | 0.4388 | 0.4356 | 0 (LAD) |
+| 74 | 0.4882 | 0.4176 | 0 (LAD) |
 
 完整 300 筆見 `results_v2/test_metrics.csv`。
 
@@ -189,13 +192,13 @@ SAM3 載入：`Loaded 442, missing 0, unexpected 22`。
 
 ## 常見調整
 
-- **半監督**：在 `run_all_v2.sh` 設定 `UNLABELED_DIR`，並確認 `consist_max_weight`、`consist_ramp_epochs`、`pseudo_threshold`。  
-- **關閉 Re-ID 或語意提示**：`train_v2.py` 的 `--no_reid`、`--no_semantic_prompt`。  
-- **密集 GNN**：`--use_dense_gnn`（取代 SparseGAT）。  
-- **跳過評估階段閾值掃描**（加快）：`evaluate_v2.py --skip_thr_sweep`。
+- **關閉 Re-ID 或語意提示**：`--no_reid`、`--no_semantic_prompt`。  
+- **密集 GNN**：`--use_dense_gnn`。  
+- **增強強度**：調整 `--artifact_prob`；幾何與 cutout 在 `data_loader_v2.py` 內可再細調。  
+- **後處理**：`evaluate_v2.py` 之 `pp_min_size`、`--pp_keep_top_k` 等（見 `--help`）。
 
 ---
 
 ## 授權與引用
 
-使用 `sam3git/` 內容時請遵循原 SAM3 專案授權與論文引用要求；本 README 僅描述本目錄內之訓練與評估流程。
+使用 `sam3git/` 時請遵循原 SAM3 專案授權與論文引用；本 README 僅描述本目錄內之訓練與評估流程。

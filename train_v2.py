@@ -1,23 +1,4 @@
-"""
-train_v2.py — SAM3 UNet V2 訓練腳本
-
-功能：
-  1. SemanticVesselPrompt + SparseGAT + ReID
-  2. 貝茲曲線偽影增強（約 35% 訓練資料帶導管/縫線偽影）
-  3. Mean Teacher 半監督式學習（可選，需無標籤資料）
-     - Teacher = Student 的 EMA (α=0.999)
-     - 無標籤：Teacher 看弱增強 → pseudo label → Student 看強增強 → consistency loss
-     - consistency weight 前 20 epoch 線性 ramp-up
-
-用法：
-  # 純監督式（帶偽影增強）
-  python train_v2.py --data ./ARCADE ...
-
-  # 半監督式（加入無標籤資料）
-  python train_v2.py --data ./ARCADE --unlabeled_dir ./unlabeled_vessels ...
-"""
-
-import argparse, sys, time, copy
+import argparse, sys, time
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -32,7 +13,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 from unet_v2         import UNetV2, SegLossV2
-from data_loader_v2  import (get_train_val_loaders, get_unlabeled_loader,
+from data_loader_v2  import (get_train_val_loaders,
                               VESSEL_TO_ID)
 
 
@@ -51,42 +32,20 @@ class AverageMeter:
         self.avg = self.sum / self.count
 
 
-def get_loss_keys(use_reid=False, use_semi=False):
-    keys = ["total", "tversky", "dice_coeff"]
+def get_loss_keys(use_reid=False):
+    keys = ["total", "bce_loss", "dice_loss", "cldice_loss", "dice_coeff"]
     if use_reid:
         keys.append("reid_loss")
-    if use_semi:
-        keys.append("consist_loss")
     return keys
-
-@torch.no_grad()
-def update_ema(student, teacher, alpha=0.999):
-    for tp, sp in zip(teacher.parameters(), student.parameters()):
-        tp.data.mul_(alpha).add_(sp.data, alpha=1.0 - alpha)
-
-
-def consistency_weight_schedule(epoch, ramp_up_epochs=20, max_weight=1.0):
-    if epoch >= ramp_up_epochs:
-        return max_weight
-    return max_weight * epoch / ramp_up_epochs
 
 def train_one_epoch(model, loader, optimizer, criterion, device,
                     scaler=None, epoch=0, total_epochs=0, accum_steps=1,
-                    use_reid=False,
-                    teacher=None, unlabeled_loader=None,
-                    consist_w=0.0, pseudo_threshold=0.7):
+                    use_reid=False):
     model.train()
-    if teacher is not None:
-        teacher.eval()
 
-    use_semi = teacher is not None and unlabeled_loader is not None and consist_w > 0
-    loss_keys = get_loss_keys(use_reid, use_semi)
+    loss_keys = get_loss_keys(use_reid)
     meters = {k: AverageMeter() for k in loss_keys}
     optimizer.zero_grad()
-
-    unlabeled_iter = None
-    if use_semi:
-        unlabeled_iter = iter(unlabeled_loader)
 
     pbar = tqdm(loader, desc=f"  Train [{epoch:3d}/{total_epochs}]",
                 leave=False, dynamic_ncols=True, unit="batch")
@@ -105,7 +64,6 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
                 else:
                     seg_logits = model(imgs, vids)
                     loss_dict  = criterion(seg_logits, masks)
-                sup_loss = loss_dict["total"]
         else:
             if use_reid:
                 seg_logits, reid_dict = model(imgs, vids, return_reid=True)
@@ -114,46 +72,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
             else:
                 seg_logits = model(imgs, vids)
                 loss_dict  = criterion(seg_logits, masks)
-            sup_loss = loss_dict["total"]
 
-        consist_loss_val = torch.tensor(0.0, device=device)
-        if use_semi:
-            try:
-                u_weak, u_strong, _, _ = next(unlabeled_iter)
-            except StopIteration:
-                unlabeled_iter = iter(unlabeled_loader)
-                u_weak, u_strong, _, _ = next(unlabeled_iter)
-
-            u_weak   = u_weak.to(device, non_blocking=True)
-            u_strong = u_strong.to(device, non_blocking=True)
-
-            with torch.no_grad():
-                t_out = teacher(u_weak)
-                if isinstance(t_out, tuple): t_out = t_out[0]
-                t_prob = torch.sigmoid(t_out[:, 1])
-
-                high_conf = (t_prob > pseudo_threshold) | (t_prob < (1.0 - pseudo_threshold))
-
-            if scaler is not None:
-                with torch.amp.autocast("cuda"):
-                    s_out = model(u_strong)
-                    if isinstance(s_out, tuple): s_out = s_out[0]
-                    s_prob = torch.sigmoid(s_out[:, 1])
-                    if high_conf.any():
-                        consist_loss_val = ((s_prob - t_prob) ** 2)[high_conf].mean()
-                    else:
-                        consist_loss_val = torch.tensor(0.0, device=device)
-            else:
-                s_out = model(u_strong)
-                if isinstance(s_out, tuple): s_out = s_out[0]
-                s_prob = torch.sigmoid(s_out[:, 1])
-                if high_conf.any():
-                    consist_loss_val = ((s_prob - t_prob) ** 2)[high_conf].mean()
-                else:
-                    consist_loss_val = torch.tensor(0.0, device=device)
-
-
-        total_loss = (sup_loss + consist_w * consist_loss_val) / accum_steps
+        total_loss = loss_dict["total"] / accum_steps
 
         if scaler is not None:
             scaler.scale(total_loss).backward()
@@ -170,35 +90,30 @@ def train_one_epoch(model, loader, optimizer, criterion, device,
                 optimizer.step()
             optimizer.zero_grad()
 
-            if teacher is not None:
-                update_ema(model, teacher, alpha=0.999)
-
         bs = imgs.size(0)
         with torch.no_grad():
             d = dice_coeff(torch.sigmoid(seg_logits.detach()[:, 1]), masks)
 
         meters["total"].update(loss_dict["total"].item(), bs)
-        meters["tversky"].update(loss_dict["tversky"].item(), bs)
+        meters["bce_loss"].update(loss_dict["bce_loss"].item(), bs)
+        meters["dice_loss"].update(loss_dict["dice_loss"].item(), bs)
+        meters["cldice_loss"].update(loss_dict["cldice_loss"].item(), bs)
         meters["dice_coeff"].update(d, bs)
         if "reid_loss" in loss_dict and "reid_loss" in meters:
             meters["reid_loss"].update(loss_dict["reid_loss"].item(), bs)
-        if "consist_loss" in meters:
-            meters["consist_loss"].update(consist_loss_val.item(), bs)
 
-        postfix = {"loss": f"{meters['total'].avg:.4f}",
-                   "dice": f"{meters['dice_coeff'].avg:.4f}"}
-        if "consist_loss" in meters:
-            postfix["cst"] = f"{meters['consist_loss'].avg:.4f}"
-        pbar.set_postfix(**postfix)
+        pbar.set_postfix({"loss": f"{meters['total'].avg:.4f}",
+                          "dice": f"{meters['dice_coeff'].avg:.4f}"})
 
     pbar.close()
     return {k: m.avg for k, m in meters.items()}
+
 
 @torch.no_grad()
 def validate(model, loader, criterion, device,
              epoch=0, total_epochs=0, use_amp=False, use_reid=False):
     model.eval()
-    loss_keys = get_loss_keys(use_reid, False)
+    loss_keys = get_loss_keys(use_reid)
     meters = {k: AverageMeter() for k in loss_keys}
 
     pbar = tqdm(loader, desc=f"  Val   [{epoch:3d}/{total_epochs}]",
@@ -221,7 +136,9 @@ def validate(model, loader, criterion, device,
         d  = dice_coeff(torch.sigmoid(seg_logits[:, 1].float()), masks)
         bs = imgs.size(0)
         meters["total"].update(loss_dict["total"].item(), bs)
-        meters["tversky"].update(loss_dict["tversky"].item(), bs)
+        meters["bce_loss"].update(loss_dict["bce_loss"].item(), bs)
+        meters["dice_loss"].update(loss_dict["dice_loss"].item(), bs)
+        meters["cldice_loss"].update(loss_dict["cldice_loss"].item(), bs)
         meters["dice_coeff"].update(d, bs)
         if "reid_loss" in loss_dict and "reid_loss" in meters:
             meters["reid_loss"].update(loss_dict["reid_loss"].item(), bs)
@@ -257,23 +174,6 @@ def train(args):
     if len(train_loader.dataset) == 0:
         print("[ERROR] No training data."); return
 
-    unlabeled_loader = None
-    use_semi = args.unlabeled_dir is not None
-    if use_semi:
-        unlabeled_loader = get_unlabeled_loader(
-            args.unlabeled_dir,
-            img_size=(args.img_size, args.img_size),
-            batch_size=args.batch,
-            num_workers=args.workers,
-            cache_ram=not args.no_cache,
-            artifact_prob=0.5,
-        )
-        print(f"Unlabeled       : {len(unlabeled_loader.dataset)}")
-        print(f"Semi-supervised : Mean Teacher (α=0.999, ramp={args.consist_ramp_epochs}ep, "
-              f"w={args.consist_max_weight}, thr={args.pseudo_threshold})")
-    else:
-        print(f"Semi-supervised : OFF")
-
     frozen = not args.unfreeze
     model = UNetV2(
         checkpoint=args.checkpoint, freeze=frozen,
@@ -295,21 +195,15 @@ def train(args):
     train_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters      : {total_p:,} total, {train_p:,} trainable")
 
-    teacher = None
-    if use_semi:
-        teacher = copy.deepcopy(model)
-        teacher.eval()
-        for p in teacher.parameters():
-            p.requires_grad = False
-        print(f"Teacher model   : created (EMA copy)")
-
     if args.resume:
-        st = torch.load(args.resume, map_location=device)
+        st = torch.load(args.resume, map_location=device, weights_only=False)
+        for key in ("model", "state_dict"):
+            if isinstance(st, dict) and key in st and isinstance(st[key], dict):
+                st = st[key]; break
         m, u = model.load_state_dict(st, strict=False)
-        if m: print(f"[INFO] Missing: {m[:5]}...")
-        if u: print(f"[INFO] Unexpected: {u[:5]}...")
-        if teacher is not None:
-            teacher.load_state_dict(st, strict=False)
+        print(f"[Resume] {args.resume}")
+        if m: print(f"[Resume] Missing: {len(m)} keys (e.g. {m[:3]})")
+        if u: print(f"[Resume] Unexpected: {len(u)} keys (e.g. {u[:3]})")
 
     if args.compile and hasattr(torch, "compile"):
         model = torch.compile(model, mode="reduce-overhead")
@@ -344,22 +238,21 @@ def train(args):
                                       eta_min=effective_lr * 1e-2)
 
     criterion = SegLossV2(
-        tversky_alpha=args.tversky_alpha,
-        tversky_beta =args.tversky_beta,
-        tversky_gamma=args.tversky_gamma,
-        lambda_reid=args.lambda_reid if args.use_reid else 0.0,
+        lambda_cldice=args.lambda_cldice,
+        lambda_reid  =args.lambda_reid if args.use_reid else 0.0,
+        cldice_iter  =args.cldice_iter,
     )
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" and args.amp else None
 
     print(f"\nLR              : backbone={backbone_lr:.2e}  decoder={effective_lr:.2e}")
     print(f"AMP             : {'ON' if scaler else 'OFF'}")
-    print(f"Loss            : FocalTversky + InfoNCE(λ={args.lambda_reid})")
-    print()
+    print(f"Loss            : WeightedBCE + WeightedDice + clDice(λ={args.lambda_cldice}, "
+          f"iter={args.cldice_iter}) + InfoNCE(λ={args.lambda_reid})")
 
     save_dir = Path(args.save_dir); save_dir.mkdir(parents=True, exist_ok=True)
     best_dice, log_rows = 0.0, []
 
-    loss_keys = get_loss_keys(args.use_reid, use_semi)
+    loss_keys = get_loss_keys(args.use_reid)
     csv_parts = ["epoch"]
     for prefix in ["tr", "va"]:
         for k in loss_keys:
@@ -370,17 +263,10 @@ def train(args):
     for epoch in (bar := tqdm(range(1, args.epochs + 1), desc="Epoch", unit="ep")):
         t0 = time.time()
 
-        cw = 0.0
-        if use_semi:
-            cw = consistency_weight_schedule(
-                epoch, args.consist_ramp_epochs, args.consist_max_weight)
-
         tr = train_one_epoch(
             model, train_loader, optimizer, criterion, device,
             scaler, epoch, args.epochs, args.accum_steps,
             use_reid=args.use_reid,
-            teacher=teacher, unlabeled_loader=unlabeled_loader,
-            consist_w=cw, pseudo_threshold=args.pseudo_threshold,
         )
         va = validate(model, val_loader, criterion, device,
                       epoch, args.epochs,
@@ -397,13 +283,12 @@ def train(args):
 
         extra = ""
         if "reid_loss" in va: extra += f"  reid={va['reid_loss']:.4f}"
-        if "consist_loss" in tr: extra += f"  cst={tr['consist_loss']:.4f}(w={cw:.2f})"
         tqdm.write(
             f"Epoch [{epoch:3d}/{args.epochs}]  "
             f"tr={tr['total']:.4f}/{tr['dice_coeff']:.4f}  "
             f"va={va['total']:.4f}/{va['dice_coeff']:.4f}"
             f"{extra}  lr={lr_now:.2e}  ({elapsed:.1f}s)"
-            + ("  ★" if is_best else ""))
+            + ("  ★THIS SHIT GOOD!!!" if is_best else ""))
 
         row = [str(epoch)]
         for prefix, metrics in [("tr", tr), ("va", va)]:
@@ -415,8 +300,6 @@ def train(args):
         if is_best:
             best_dice = va["dice_coeff"]
             torch.save(model.state_dict(), save_dir / "best_model.pth")
-            if teacher is not None:
-                torch.save(teacher.state_dict(), save_dir / "best_teacher.pth")
         if epoch % args.save_every == 0:
             torch.save(model.state_dict(), save_dir / f"epoch_{epoch:04d}.pth")
 
@@ -441,9 +324,10 @@ def train(args):
 
     print(f"\nDone. Best val Dice = {best_dice:.4f}  →  {save_dir}")
 
+
 def _parse():
     p = argparse.ArgumentParser(
-        description="SAM3 UNet V2 (SemanticPrompt + SparseGAT + ReID + MeanTeacher)")
+        description="SAM3 UNet V2 (SemanticPrompt + SparseGAT + ReID)")
 
     p.add_argument("--data",        type=str, required=True)
     p.add_argument("--vessels",     type=str, default="LAD,LCx,RCA")
@@ -455,14 +339,6 @@ def _parse():
     p.add_argument("--split_seed",  type=int,   default=42)
     p.add_argument("--artifact_prob", type=float, default=0.35,
                    help="訓練資料加偽影的機率（0.35 ≈ 1/3）")
-    p.add_argument("--unlabeled_dir", type=str, default=None,
-                   help="無標籤血管影像資料夾路徑（留空 = 純監督式）")
-    p.add_argument("--consist_max_weight", type=float, default=1.0,
-                   help="consistency loss 最大權重")
-    p.add_argument("--consist_ramp_epochs", type=int, default=20,
-                   help="consistency weight ramp-up epoch 數")
-    p.add_argument("--pseudo_threshold", type=float, default=0.7,
-                   help="Teacher pseudo label 信心門檻")
     p.add_argument("--epochs",      type=int,   default=100)
     p.add_argument("--batch",       type=int,   default=8)
     p.add_argument("--accum_steps", type=int,   default=1)
@@ -492,9 +368,10 @@ def _parse():
     p.add_argument("--gnn_iters",      type=int,   default=3)
     p.add_argument("--reid_embed_dim", type=int, default=128)
     p.add_argument("--lambda_reid",    type=float, default=0.1)
-    p.add_argument("--tversky_alpha", type=float, default=0.5)
-    p.add_argument("--tversky_beta",  type=float, default=0.5)
-    p.add_argument("--tversky_gamma", type=float, default=4.0 / 3.0)
+    p.add_argument("--lambda_cldice", type=float, default=0.5,
+                   help="clDice 在總損失中的權重（reference 預設 0.5）")
+    p.add_argument("--cldice_iter",   type=int,   default=10,
+                   help="clDice 中 SoftSkeletonize 迭代次數（越大越慢但骨架更乾淨）")
 
     args = p.parse_args()
     if args.no_semantic_prompt: args.use_semantic_prompt = False

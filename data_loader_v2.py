@@ -50,8 +50,9 @@ def vessel_cutout(img: np.ndarray, mask: np.ndarray,
             0.0, 0.3, (y2 - y1, x2 - x1)).astype(img_out.dtype)
     return img_out
 
-def _cubic_bezier(p0, p1, p2, p3, n_points=200):
 
+def _cubic_bezier(p0, p1, p2, p3, n_points=200):
+    """三次貝茲曲線: B(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3"""
     t = np.linspace(0, 1, n_points).reshape(-1, 1)
     pts = ((1-t)**3 * p0 + 3*(1-t)**2*t * p1
            + 3*(1-t)*t**2 * p2 + t**3 * p3)
@@ -59,14 +60,13 @@ def _cubic_bezier(p0, p1, p2, p3, n_points=200):
 
 
 def _quadratic_bezier(p0, p1, p2, n_points=100):
-
+    """二次貝茲曲線: B(t) = (1-t)²P0 + 2(1-t)tP1 + t²P2"""
     t = np.linspace(0, 1, n_points).reshape(-1, 1)
     pts = (1-t)**2 * p0 + 2*(1-t)*t * p1 + t**2 * p2
     return pts.astype(np.float32)
 
 
 def _random_edge_point(h, w):
-
     edge = np.random.randint(4)
     if edge == 0:    # top
         return np.array([0, np.random.randint(w)], dtype=np.float32)
@@ -89,11 +89,11 @@ def _draw_smooth_curve(img, points, thickness, intensity, blur_sigma=0.8):
     if blur_sigma > 0:
         ksize = int(blur_sigma * 4) | 1
         canvas = cv2.GaussianBlur(canvas, (ksize, ksize), blur_sigma)
-    # 混合：在線條區域，用 intensity 值覆蓋
     mask_line = canvas > 0.01
     blend = canvas / canvas.max().clip(min=1e-6)
     img_out = img.copy()
-    img_out[mask_line] = img[mask_line] * (1.0 - blend[mask_line]) + intensity * blend[mask_line]
+    new_val = img[mask_line] * (1.0 - blend[mask_line]) + intensity * blend[mask_line]
+    img_out[mask_line] = np.minimum(img[mask_line], new_val)
     return img_out
 
 
@@ -123,7 +123,15 @@ def draw_catheter(img, h, w):
     if np.random.random() > 0.5:
         cy, cx = int(p3[0]), int(p3[1])
         r = np.random.randint(3, 7)
-        cv2.circle(img, (cx, cy), r, intensity * 0.5, -1, lineType=cv2.LINE_AA)
+        marker_intensity = intensity * 0.5
+
+        canvas = np.zeros_like(img)
+        cv2.circle(canvas, (cx, cy), r, 1.0, -1, lineType=cv2.LINE_AA)
+        mask_c = canvas > 0.01
+        if mask_c.any():
+            blend = canvas / canvas.max().clip(min=1e-6)
+            new_val = img[mask_c] * (1 - blend[mask_c]) + marker_intensity * blend[mask_c]
+            img[mask_c] = np.minimum(img[mask_c], new_val)
 
     return img
 
@@ -131,6 +139,7 @@ def draw_catheter(img, h, w):
 def draw_guidewire(img, h, w):
 
     p0 = _random_edge_point(h, w)
+
     p3 = _random_edge_point(h, w)
 
     while np.linalg.norm(p3 - p0) < min(h, w) * 0.4:
@@ -161,6 +170,7 @@ def _draw_single_sternal_wire(img, cy, cx, h, w):
     wire_type = np.random.choice(["clip", "loop", "twist"])
 
     if wire_type == "clip":
+
         for sign in [-1, 1]:
             dy = np.cos(angle + sign * 0.4) * size
             dx = np.sin(angle + sign * 0.4) * size
@@ -173,10 +183,12 @@ def _draw_single_sternal_wire(img, cy, cx, h, w):
             img = _draw_smooth_curve(img, pts, thickness, intensity, blur_sigma=0.3)
 
     elif wire_type == "loop":
+
         for t_frac in np.linspace(0, 2*np.pi, 40):
-            pass
+            pass  # 改用 cv2.ellipse
         axes = (size // 2, size // 3)
         angle_deg = np.degrees(angle)
+
         canvas = np.zeros_like(img)
         cv2.ellipse(canvas, (int(cx), int(cy)), axes,
                     angle_deg, 0, 360, 1.0, thickness, lineType=cv2.LINE_AA)
@@ -184,9 +196,11 @@ def _draw_single_sternal_wire(img, cy, cx, h, w):
         canvas = cv2.GaussianBlur(canvas, (ksize, ksize), 0.5)
         mask_l = canvas > 0.01
         blend = canvas / canvas.max().clip(min=1e-6)
-        img[mask_l] = img[mask_l] * (1 - blend[mask_l]) + intensity * blend[mask_l]
+        new_val = img[mask_l] * (1 - blend[mask_l]) + intensity * blend[mask_l]
+        img[mask_l] = np.minimum(img[mask_l], new_val)
 
     elif wire_type == "twist":
+
         for sign_y, sign_x in [(-1, -1), (-1, 1), (1, -1), (1, 1)]:
             dy = sign_y * np.cos(angle) * size * 0.7
             dx = sign_x * np.sin(angle) * size * 0.7
@@ -219,12 +233,7 @@ def draw_sternal_wires(img, h, w):
 
 
 def bezier_artifact_augmentation(img, artifact_prob=0.35):
-    """
-    - 導管 (40% of triggered)
-    - 導絲 (50% of triggered)
-    - 胸骨縫線 (40% of triggered)
-    - 至少會觸發一種
-    """
+
     if np.random.random() > artifact_prob:
         return img
 
@@ -386,95 +395,6 @@ class ArcadeDataset(Dataset):
 
         return img_t, mask_t, vessel_id, str(self.samples[idx][0])
 
-class UnlabeledDataset(Dataset):
-
-    def __init__(
-        self,
-        root: str,
-        img_size: Optional[Tuple[int, int]] = (512, 512),
-        cache_ram: bool = True,
-        artifact_prob: float = 0.5,
-    ):
-        self.root     = Path(root)
-        self.img_size = img_size
-        self.cache_ram = cache_ram
-        self.artifact_prob = artifact_prob
-
-        self.paths: List[Path] = []
-        for ext in ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif"]:
-            self.paths.extend(sorted(self.root.rglob(ext)))
-
-        print(f"[Unlabeled] 找到 {len(self.paths)} 張無標籤影像 from {root}")
-
-        self._cache: List[np.ndarray] = []
-        if cache_ram and len(self.paths) > 0:
-            self._build_cache()
-
-    def _build_cache(self):
-        print(f"[Unlabeled] 預載 {len(self.paths)} 張...")
-        for p in tqdm(self.paths, desc="  快取 unlabeled",
-                      unit="img", dynamic_ncols=True, leave=False):
-            arr = self._read_and_resize(p)
-            self._cache.append(arr)
-        print(f"[Unlabeled] 快取完成，共 {len(self.paths)} 張。")
-
-    def _read_and_resize(self, img_path):
-        img = Image.open(img_path).convert("L")
-        if self.img_size:
-            img = img.resize((self.img_size[1], self.img_size[0]), Image.BILINEAR)
-        img_arr = np.array(img, dtype=np.uint8)
-        clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        img_arr = clahe.apply(img_arr)
-        return img_arr
-
-    def _weak_augment(self, img_f32):
-        img_pil = Image.fromarray((img_f32 * 255).clip(0, 255).astype(np.uint8))
-        if torch.rand(1).item() > 0.5:
-            img_pil = TF.hflip(img_pil)
-        img_pil = TF.adjust_brightness(img_pil, 0.9 + 0.2 * torch.rand(1).item())
-        return np.array(img_pil, dtype=np.float32) / 255.0
-
-    def _strong_augment(self, img_f32):
-        img_pil = Image.fromarray((img_f32 * 255).clip(0, 255).astype(np.uint8))
-
-        if torch.rand(1).item() > 0.5:
-            img_pil = TF.hflip(img_pil)
-        if torch.rand(1).item() > 0.5:
-            img_pil = TF.vflip(img_pil)
-        angle = (torch.rand(1).item() - 0.5) * 60
-        img_pil = TF.rotate(img_pil, angle, interpolation=TF.InterpolationMode.BILINEAR)
-        img_pil = TF.adjust_brightness(img_pil, 0.7 + 0.6 * torch.rand(1).item())
-        img_pil = TF.adjust_contrast(img_pil,   0.7 + 0.6 * torch.rand(1).item())
-
-        img_f32 = np.array(img_pil, dtype=np.float32) / 255.0
-
-        if torch.rand(1).item() > 0.5:
-            dummy_mask = np.zeros_like(img_f32)
-            img_f32, _ = elastic_transform(img_f32, dummy_mask)
-
-        img_f32 = bezier_artifact_augmentation(img_f32, self.artifact_prob)
-
-        return np.clip(img_f32, 0.0, 1.0)
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, idx):
-        if self.cache_ram:
-            img_u8 = self._cache[idx]
-        else:
-            img_u8 = self._read_and_resize(self.paths[idx])
-
-        img_f32 = img_u8.astype(np.float32) / 255.0
-
-        img_weak   = self._weak_augment(img_f32)
-        img_strong = self._strong_augment(img_f32)
-
-        img_weak_t   = torch.from_numpy(img_weak).unsqueeze(0)
-        img_strong_t = torch.from_numpy(img_strong).unsqueeze(0)
-
-        return img_weak_t, img_strong_t, -1, str(self.paths[idx])
-
 def get_loader(root, split, vessels=("LAD", "LCx", "RCA"),
                img_size=(512, 512), batch_size=4, num_workers=4,
                cache_ram=True, artifact_prob=0.0):
@@ -555,18 +475,14 @@ def get_train_val_loaders(root, vessels=("LAD", "LCx", "RCA"),
             name = id_to_name.get(vid, f"V{vid}")
             print(f"        {name}: train={tr_vids[vid]}  val={va_vids[vid]}")
 
-
-    train_loader = DataLoader(tr, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, drop_last=True, persistent_workers=persistent, prefetch_factor=prefetch)
-    val_loader = DataLoader(va, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True, drop_last=False,persistent_workers=persistent, prefetch_factor=prefetch)
-    return train_loader, val_loader
-
-
-def get_unlabeled_loader(root, img_size=(512, 512), batch_size=4, num_workers=4, cache_ram=True, artifact_prob=0.5):
-    ds = UnlabeledDataset(root, img_size, cache_ram, artifact_prob)
-    persistent = (num_workers > 0)
-    prefetch   = 4 if num_workers > 0 else None
-    return DataLoader(
-        ds, batch_size=batch_size, shuffle=True,
+    train_loader = DataLoader(
+        tr, batch_size=batch_size, shuffle=True,
         num_workers=num_workers, pin_memory=True, drop_last=True,
         persistent_workers=persistent, prefetch_factor=prefetch,
     )
+    val_loader = DataLoader(
+        va, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True, drop_last=False,
+        persistent_workers=persistent, prefetch_factor=prefetch,
+    )
+    return train_loader, val_loader

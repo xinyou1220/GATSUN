@@ -19,6 +19,13 @@ from tqdm import tqdm
 
 from unet_v2        import UNetV2, soft_skeletonize
 from data_loader_v2 import get_loader, VESSEL_TO_ID
+from eval_metrics_extras import (
+    compute_dice  as _ext_dice,
+    compute_iou   as _ext_iou,
+    compute_hd95  as _ext_hd95,
+    measure_inference_latency,
+    count_flops,
+)
 
 
 FIXED_VIS_SAMPLES = {
@@ -26,6 +33,7 @@ FIXED_VIS_SAMPLES = {
     "LCx": {"Hard": [75, 252], "Simple": [198,  97]},
     "RCA": {"Hard": [25, 114], "Simple": [ 99, 167]},
 }
+
 
 def dice_score(pred, gt, smooth=1e-6):
     p, g = pred.astype(bool).ravel(), gt.astype(bool).ravel()
@@ -64,7 +72,7 @@ def predict_with_tta(model, imgs, vids, device, use_amp=True):
 
 
 def reconnect_by_dist(prob, high_thr=0.45, low_thr=0.25, max_iter=6):
-    if hasattr(prob, "cpu"): prob = prob.cpu().numpy()
+    if hasattr(prob, "cpu"): prob = prob.detach().cpu().numpy()
     seed = prob > high_thr
     cand = prob > low_thr
     if not seed.any(): return cand
@@ -76,9 +84,36 @@ def reconnect_by_dist(prob, high_thr=0.45, low_thr=0.25, max_iter=6):
     return cur
 
 
+def keep_largest_components(mask, n_keep=1, min_ratio=0.0, connectivity=2):
+
+    if n_keep <= 0 or not mask.any():
+        return mask
+    from skimage.measure import label
+    lbl = label(mask, connectivity=connectivity)
+    n_lbl = int(lbl.max())
+    if n_lbl <= 1:
+        return mask
+
+    sizes = np.bincount(lbl.ravel())[1:]
+    order = np.argsort(sizes)[::-1]
+    top   = order[: max(1, int(n_keep))] + 1
+    largest = sizes[order[0]]
+    if min_ratio > 0:
+        thresh = float(largest) * float(min_ratio)
+        top = [lab for lab in top if sizes[lab - 1] >= thresh]
+        if not top:
+            top = [int(order[0]) + 1]
+    out = np.zeros_like(mask, dtype=bool)
+    for lab in top:
+        out |= (lbl == lab)
+    return out
+
+
 def postprocess(prob_np, high_thr=0.50, low_thr=0.25, min_size=50,
-                max_reconnect_iter=6):
-    if hasattr(prob_np, "cpu"): prob_np = prob_np.cpu().numpy()
+                max_reconnect_iter=6,
+                keep_top_k=0, lcc_min_ratio=0.0):
+
+    if hasattr(prob_np, "cpu"): prob_np = prob_np.detach().cpu().numpy()
     if low_thr is not None and low_thr < high_thr:
         mask = reconnect_by_dist(prob_np, high_thr=high_thr, low_thr=low_thr,
                                  max_iter=max_reconnect_iter)
@@ -87,7 +122,11 @@ def postprocess(prob_np, high_thr=0.50, low_thr=0.25, min_size=50,
     mask = mask.astype(bool)
     if min_size > 0:
         mask = remove_small_objects(mask, min_size=min_size)
+    if keep_top_k > 0:
+        mask = keep_largest_components(mask, n_keep=keep_top_k,
+                                       min_ratio=lcc_min_ratio)
     return mask
+
 
 def plot_training_curves(csv_path, out_dir):
     with open(csv_path) as f:
@@ -127,59 +166,9 @@ def plot_training_curves(csv_path, out_dir):
 
 
 @torch.no_grad()
-def find_best_threshold(model, loader, device,
-                        high_thresholds=(0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65),
-                        low_thr_ratios=(None, 0.4, 0.5, 0.6, 0.7),
-                        min_size=50, use_tta=True, use_amp=True, set_name="Val"):
-    model.eval()
-    all_probs, all_masks = [], []
-
-    for imgs, masks, vids, _ in tqdm(loader, desc=f"  Sweep[{set_name}]",
-                                     leave=False, dynamic_ncols=True, unit="b"):
-        imgs = imgs.to(device, non_blocking=True)
-        vids = vids.to(device, non_blocking=True)
-        if use_tta:
-            prob = predict_with_tta(model, imgs, vids, device, use_amp)
-        else:
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                out = model(imgs, vids)
-                seg = out[0] if isinstance(out, tuple) else out
-            prob = torch.sigmoid(seg[:, 1].float())
-        for i in range(imgs.size(0)):
-            all_probs.append(prob[i].cpu().numpy())
-            all_masks.append(masks[i].numpy().astype(bool))
-
-    n = len(all_probs)
-    print(f"\n[Threshold Sweep on {set_name}] ({n} samples)")
-    print(f"  {'high':>6} {'low':>6}  {'Dice':>7}  {'Prec':>7}  {'Rec':>7}")
-    best_h, best_l, best_d = 0.5, None, -1.0
-
-    for ht in high_thresholds:
-        for lr in low_thr_ratios:
-            lt = ht * lr if lr is not None else None
-            inter_sum = pred_sum = gt_sum = 0.0
-            for prob_np, mask_np in zip(all_probs, all_masks):
-                pred       = postprocess(prob_np, high_thr=ht, low_thr=lt,
-                                         min_size=min_size)
-                inter_sum += (pred & mask_np).sum()
-                pred_sum  += pred.sum()
-                gt_sum    += mask_np.sum()
-            d    = (2.0 * inter_sum + 1.0) / (pred_sum + gt_sum + 1.0)
-            prec = inter_sum / max(pred_sum, 1.0)
-            rec  = inter_sum / max(gt_sum, 1.0)
-            flag = " ★" if d > best_d else ""
-            lt_s = f"{lt:.2f}" if lt is not None else " None"
-            print(f"  {ht:6.2f} {lt_s:>6}  {d:7.4f}  {prec:7.4f}  {rec:7.4f}{flag}")
-            if d > best_d:
-                best_h, best_l, best_d = ht, lt, d
-
-    lt_disp = f"{best_l:.2f}" if best_l is not None else "None"
-    print(f"  → Best ({set_name}): high={best_h:.2f}  low={lt_disp}  Dice={best_d:.4f}\n")
-    return best_h, best_l, best_d
-
-@torch.no_grad()
 def evaluate_test(model, loader, device, out_dir, n_vis=16, cldice_iter=15,
-                  threshold=0.5, low_thr=None, min_size=50, collect_reid=False):
+                  threshold=0.5, low_thr=None, min_size=50, collect_reid=False,
+                  keep_top_k=0, lcc_min_ratio=0.0):
     model.eval()
     compare_dir = out_dir / "comparisons"
     compare_dir.mkdir(parents=True, exist_ok=True)
@@ -204,26 +193,34 @@ def evaluate_test(model, loader, device, out_dir, n_vis=16, cldice_iter=15,
                 seg_logits = out[0] if isinstance(out, tuple) else out
                 reid_dict = None
 
-        prob = torch.sigmoid(seg_logits[:, 1].float())
+        prob = torch.sigmoid(seg_logits[:, 1].float()).detach()
 
         if reid_dict is not None and reid_dict.get("vessel_embed") is not None:
-            reid_embeds.append(reid_dict["vessel_embed"].cpu())
+            reid_embeds.append(reid_dict["vessel_embed"].detach().cpu())
             reid_labels.append(vids.cpu())
 
         for i in range(imgs.size(0)):
             prob_np  = prob[i].cpu().numpy()
-            mask_np  = masks[i].cpu().numpy().astype(bool)
-            img_np   = imgs[i, 0].cpu().numpy()
+            mask_np  = masks[i].detach().cpu().numpy().astype(bool)
+            img_np   = imgs[i, 0].detach().cpu().numpy()
             pred_np  = postprocess(prob_np, high_thr=threshold, low_thr=low_thr,
-                                   min_size=min_size)
+                                   min_size=min_size,
+                                   keep_top_k=keep_top_k,
+                                   lcc_min_ratio=lcc_min_ratio)
 
             d_sc  = dice_score(pred_np, mask_np)
             cl_sc = cldice_score(prob[i].cpu(), masks[i].float().cpu(),
                                  n_iter=cldice_iter)
+            iou_sc  = _ext_iou (pred_np, mask_np)
+            hd95_sc = _ext_hd95(pred_np, mask_np, spacing=1.0)
 
             fname = Path(paths[i]).stem
-            all_metrics.append({"filename": fname, "dice": d_sc,
-                                "cldice": cl_sc, "vessel_id": vids[i].item()})
+            all_metrics.append({"filename": fname,
+                                "dice":   d_sc,
+                                "cldice": cl_sc,
+                                "iou":    iou_sc,
+                                "hd95":   hd95_sc,
+                                "vessel_id": vids[i].item()})
             cache[fname] = (img_np, mask_np.astype(float),
                            pred_np.astype(float), prob_np)
 
@@ -253,14 +250,15 @@ def evaluate_test(model, loader, device, out_dir, n_vis=16, cldice_iter=15,
 
     return all_metrics, cache
 
+
 def _plot_reid_tsne(embeds_list, labels_list, out_dir):
     try:
         from sklearn.manifold import TSNE
     except ImportError:
         print("[WARN] sklearn not found, skipping t-SNE."); return
 
-    all_emb = torch.cat(embeds_list, dim=0).numpy()
-    all_lab = torch.cat(labels_list, dim=0).numpy()
+    all_emb = torch.cat(embeds_list, dim=0).detach().numpy()
+    all_lab = torch.cat(labels_list, dim=0).detach().numpy()
     if len(all_emb) < 10:
         print("[WARN] Too few samples for t-SNE."); return
 
@@ -284,9 +282,11 @@ def _plot_reid_tsne(embeds_list, labels_list, out_dir):
     plt.close(fig)
     print(f"[OK] Re-ID t-SNE → {out_dir / 'reid_tsne.png'}")
 
+
 def plot_fixed_samples(model, dataset, fixed_map, device, out_dir,
                        threshold=0.5, low_thr=None, min_size=50,
-                       cldice_iter=15, use_amp=True):
+                       cldice_iter=15, use_amp=True,
+                       keep_top_k=0, lcc_min_ratio=0.0):
     def _stem_to_int(stem):
         try:    return int(stem)
         except ValueError: return None
@@ -342,13 +342,15 @@ def plot_fixed_samples(model, dataset, fixed_map, device, out_dir,
                                     enabled=(device.type == "cuda" and use_amp)):
                 out = model(img_b, vid_b)
                 seg = out[0] if isinstance(out, tuple) else out
-            prob    = torch.sigmoid(seg[0, 1].float())
+            prob    = torch.sigmoid(seg[0, 1].float()).detach()
             prob_np = prob.cpu().numpy()
             pred_np = postprocess(prob_np, high_thr=threshold,
-                                  low_thr=low_thr, min_size=min_size).astype(np.int64)
+                                  low_thr=low_thr, min_size=min_size,
+                                  keep_top_k=keep_top_k,
+                                  lcc_min_ratio=lcc_min_ratio).astype(np.int64)
 
-            img_np  = img_t[0].numpy()
-            mask_np = mask_t.numpy()
+            img_np  = img_t[0].detach().numpy()
+            mask_np = mask_t.detach().numpy()
             d_sc    = dice_score(pred_np, mask_np)
             cl_sc   = cldice_score(prob.cpu(), mask_t.float(), n_iter=cldice_iter)
 
@@ -378,6 +380,7 @@ def plot_fixed_samples(model, dataset, fixed_map, device, out_dir,
     fig.savefig(out_dir / "fixed_samples.png", dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"[OK] Fixed samples → {out_dir / 'fixed_samples.png'}")
+
 
 def plot_summary_grid(metrics, cache, out_dir, top_k=4):
     sorted_m = sorted(metrics, key=lambda x: x["dice"])
@@ -416,14 +419,16 @@ def plot_summary_grid(metrics, cache, out_dir, top_k=4):
 def main(args):
     device  = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── [1] Training curves ──
     csv_p = Path(args.log_csv)
     if csv_p.exists():
-        print("\n[1/6] Training curves...")
+        print("\n[1/7] Training curves...")
         plot_training_curves(str(csv_p), out_dir)
     else:
-        print(f"\n[1/6] {csv_p} not found, skipping.")
+        print(f"\n[1/7] {csv_p} not found, skipping.")
 
-    print("\n[2/6] Loading model...")
+    print("\n[2/7] Loading model...")
     config_path = Path(args.ckpt).parent / "model_config.pth"
     if config_path.exists():
         config = torch.load(config_path, map_location="cpu")
@@ -458,33 +463,30 @@ def main(args):
     vessels     = args.vessels.split(",")
     pp_min_size = args.pp_min_size
     collect_reid = config.get("use_reid", True)
-
-    best_thr_val, best_low_val, best_dice_val = 0.5, None, None
-    if args.skip_thr_sweep:
-        print(f"\n[3/6] Threshold sweep skipped, using fixed = {best_thr_val}")
+    pp_lcc_kwargs = dict(keep_top_k=int(args.pp_keep_top_k),
+                         lcc_min_ratio=float(args.pp_lcc_min_ratio))
+    if pp_lcc_kwargs["keep_top_k"] > 0:
+        print(f"Postproc LCC : keep_top_k={pp_lcc_kwargs['keep_top_k']}  "
+              f"min_ratio={pp_lcc_kwargs['lcc_min_ratio']:.3f}  (enabled)")
     else:
-        print("\n[3/6] Threshold sweep on val set...")
-        val_loader = get_loader(args.data, "val", vessels=vessels,
-                                img_size=(args.img_size, args.img_size),
-                                batch_size=args.batch, num_workers=args.workers,
-                                cache_ram=not args.no_cache)
-        if len(val_loader.dataset) == 0:
-            print("[WARN] No val data. Falling back to threshold = 0.5")
-        else:
-            best_thr_val, best_low_val, best_dice_val = find_best_threshold(
-                model, val_loader, device, use_tta=False,
-                min_size=pp_min_size, set_name="Val")
-        del val_loader
+        print(f"Postproc LCC : disabled (--pp_keep_top_k=0)")
 
-    print("\n[4/6] Test inference...")
+    best_thr_val = 0.5
+    best_low_val = None
+    print(f"\n[3/7] Using fixed threshold = {best_thr_val}")
+
+    print("\n[4/7] Test inference...")
     test_loader = get_loader(args.data, "test", vessels=vessels,
                              img_size=(args.img_size, args.img_size),
                              batch_size=args.batch, num_workers=args.workers,
                              cache_ram=not args.no_cache)
     print(f"Test samples : {len(test_loader.dataset)}")
     lt_disp = f"{best_low_val:.2f}" if best_low_val is not None else "None"
+    lcc_disp = (f"  LCC(top_k={pp_lcc_kwargs['keep_top_k']}, "
+                f"min_ratio={pp_lcc_kwargs['lcc_min_ratio']:.2f})"
+                if pp_lcc_kwargs["keep_top_k"] > 0 else "")
     print(f"Postprocess  : high={best_thr_val:.2f}  low={lt_disp}  "
-          f"min_size={pp_min_size}")
+          f"min_size={pp_min_size}{lcc_disp}")
     if len(test_loader.dataset) == 0:
         print("[ERROR] No test data."); return
 
@@ -493,59 +495,110 @@ def main(args):
         n_vis=args.n_vis, cldice_iter=args.cldice_iter,
         threshold=best_thr_val, low_thr=best_low_val, min_size=pp_min_size,
         collect_reid=collect_reid,
+        **pp_lcc_kwargs,
     )
 
     csv_out = out_dir / "test_metrics.csv"
     with open(csv_out, "w") as f:
-        f.write("filename,dice,cldice,vessel_id\n")
+        f.write("filename,dice,cldice,iou,hd95,vessel_id\n")
         for m in metrics:
             f.write(f"{m['filename']},{m['dice']:.6f},{m['cldice']:.6f},"
+                    f"{m['iou']:.6f},{m['hd95']:.4f},"
                     f"{m['vessel_id']}\n")
 
     dices   = [m["dice"]   for m in metrics]
     cldices = [m["cldice"] for m in metrics]
+    ious    = [m["iou"]    for m in metrics]
+    hd95s   = [m["hd95"]   for m in metrics]
     print(f"\n{'='*50}")
     print(f" Test Results  ({len(metrics)} samples, high={best_thr_val:.2f}, "
           f"low={lt_disp})")
     print(f"{'='*50}")
-    print(f"  Dice   : {np.mean(dices):.4f} +/- {np.std(dices):.4f}")
+    print(f"  Dice   : {np.mean(dices):.4f} +/- {np.std(dices):.4f}   "
+          f"(per-image mean)")
     print(f"  clDice : {np.mean(cldices):.4f} +/- {np.std(cldices):.4f}")
+    print(f"  IoU    : {np.mean(ious):.4f} +/- {np.std(ious):.4f}   "
+          f"(per-image mean)")
+    print(f"  HD95   : {np.mean(hd95s):.4f} +/- {np.std(hd95s):.4f}   "
+          f"(pixel, per-image mean)")
 
     id_to_name = {v: k for k, v in VESSEL_TO_ID.items()}
     for vid in sorted(set(m["vessel_id"] for m in metrics)):
         sub = [m for m in metrics if m["vessel_id"] == vid]
         name = id_to_name.get(vid, f"V{vid}")
         print(f"    {name:>3}: n={len(sub):3d}  "
-              f"Dice={np.mean([m['dice'] for m in sub]):.4f}  "
-              f"clDice={np.mean([m['cldice'] for m in sub]):.4f}")
+              f"Dice={np.mean([m['dice']   for m in sub]):.4f}  "
+              f"clDice={np.mean([m['cldice'] for m in sub]):.4f}  "
+              f"IoU={np.mean([m['iou']    for m in sub]):.4f}  "
+              f"HD95={np.mean([m['hd95']   for m in sub]):.2f}")
 
-    if not args.skip_thr_sweep and len(test_loader.dataset) > 0:
-        best_thr_test, best_low_test, best_dice_test = find_best_threshold(
-            model, test_loader, device, use_tta=False,
-            min_size=pp_min_size, set_name="Test")
-        lt_test = f"{best_low_test:.2f}" if best_low_test is not None else "None"
-        print(f"{'='*50}")
-        print(" Threshold Sanity Check")
-        print(f"{'='*50}")
-        if best_dice_val is not None:
-            print(f"  Val   best : high={best_thr_val:.2f}  low={lt_disp}"
-                  f"   Dice={best_dice_val:.4f}")
-        print(f"  Test  best : high={best_thr_test:.2f}  low={lt_test}"
-              f"   Dice={best_dice_test:.4f}")
-        gap = abs(best_thr_test - best_thr_val)
-        if gap >= 0.10:
-            print(f"  [!] high threshold 差距 {gap:.2f} 偏大，val/test 分布有差異。")
-        else:
-            print(f"  [OK] val/test high threshold 接近 (差 {gap:.2f})。")
-
+    print("\n[5/7] Summary grid (worst/median/best)...")
     plot_summary_grid(metrics, cache, out_dir, args.top_k)
 
-    # ── [6] Fixed-sample visualization ──
-    print("\n[6/6] Fixed-sample visualization...")
+    print("\n[6/7] Fixed-sample visualization...")
     plot_fixed_samples(model, test_loader.dataset, FIXED_VIS_SAMPLES,
                        device, out_dir,
                        threshold=best_thr_val, low_thr=best_low_val,
-                       min_size=pp_min_size, cldice_iter=args.cldice_iter)
+                       min_size=pp_min_size, cldice_iter=args.cldice_iter,
+                       **pp_lcc_kwargs)
+
+    print("\n[7/7] Inference profile (FLOPs + latency, batch=1)...")
+    try:
+        flops_info = count_flops(
+            model,
+            input_shape=(1, 1, args.img_size, args.img_size),
+            device=str(device),
+        )
+        if flops_info["gflops"] >= 0:
+            print(f"  FLOPs  : {flops_info['gflops']:.2f} GFLOPs  "
+                  f"({flops_info['method']})")
+        else:
+            print(f"  FLOPs  : [SKIP] {flops_info['note']}")
+    except Exception as e:
+        print(f"  FLOPs  : [ERROR] {type(e).__name__}: {e}")
+        flops_info = {"flops": -1, "gflops": -1.0,
+                      "method": "error", "note": str(e)}
+
+    try:
+        lat = measure_inference_latency(
+            model,
+            input_shape=(1, 1, args.img_size, args.img_size),
+            device=str(device),
+            n_warmup=20, n_runs=100,
+            use_amp=False,
+        )
+        print(f"  Latency: median={lat['median_ms']:.2f} ms  "
+              f"p95={lat['p95_ms']:.2f} ms  p99={lat['p99_ms']:.2f} ms  "
+              f"FPS={lat['fps']:.1f}")
+    except Exception as e:
+        print(f"  Latency: [ERROR] {type(e).__name__}: {e}")
+        lat = None
+
+    try:
+        with open(out_dir / "inference_profile.txt", "w", encoding="utf-8") as f:
+            f.write(f"Checkpoint     : {args.ckpt}\n")
+            f.write(f"Image size     : {args.img_size}x{args.img_size}, "
+                    f"batch=1\n")
+            f.write(f"GFLOPs         : {flops_info['gflops']:.4f}\n")
+            f.write(f"FLOPs method   : {flops_info['method']}\n")
+            f.write(f"FLOPs note     : {flops_info.get('note','')}\n")
+            if lat is not None:
+                f.write(f"Device         : {lat['device']}\n")
+                f.write(f"AMP            : {lat['amp']}\n")
+                f.write(f"n_warmup       : {lat['n_warmup']}\n")
+                f.write(f"n_runs         : {lat['n_runs']}\n")
+                f.write(f"Latency median : {lat['median_ms']:.3f} ms\n")
+                f.write(f"Latency mean   : {lat['mean_ms']:.3f} ms"
+                        f"  (std={lat['std_ms']:.3f})\n")
+                f.write(f"Latency p50    : {lat['p50_ms']:.3f} ms\n")
+                f.write(f"Latency p95    : {lat['p95_ms']:.3f} ms\n")
+                f.write(f"Latency p99    : {lat['p99_ms']:.3f} ms\n")
+                f.write(f"Latency min    : {lat['min_ms']:.3f} ms\n")
+                f.write(f"Latency max    : {lat['max_ms']:.3f} ms\n")
+                f.write(f"FPS (median)   : {lat['fps']:.2f}\n")
+        print(f"[OK] Inference profile → {out_dir / 'inference_profile.txt'}")
+    except Exception as e:
+        print(f"  [WARN] failed to write inference_profile.txt: {e}")
 
     print("\nDone.")
 
@@ -565,8 +618,13 @@ def _parse():
     p.add_argument("--top_k",          type=int, default=4)
     p.add_argument("--cldice_iter",    type=int, default=10)
     p.add_argument("--gnn_iters",      type=int, default=3)
-    p.add_argument("--skip_thr_sweep", action="store_true")
-    p.add_argument("--pp_min_size",    type=int, default=50)
+    p.add_argument("--pp_min_size",    type=int, default=50,
+                   help="移除像素數 < N 的散點（remove_small_objects）。")
+    p.add_argument("--pp_keep_top_k",  type=int, default=0,
+                   help="最大連通去雜訊：保留前 N 大連通元件（0 = 關閉）。")
+    p.add_argument("--pp_lcc_min_ratio", type=float, default=0.0,
+                   help="LCC 內額外過濾：元件面積 < 最大 × ratio 即丟棄"
+                        "（0 = 不啟用）。")
     return p.parse_args()
 
 
